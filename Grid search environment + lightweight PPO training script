@@ -62,7 +62,7 @@ class GridSearchEnv:
         else:
             self.agent_pos = agent_start
         if evader_start is None:
-            self.evader_pos = tuple(self.np_rng.choice(len(free_cells)))  # temporary placeholder
+            # self.evader_pos = tuple(self.np_rng.choice(len(free_cells)))  # temporary placeholder
             # pick a uniform random free cell, ensure not equal to agent
             self.evader_pos = self._sample_free_cell(exclude={self.agent_pos})
         else:
