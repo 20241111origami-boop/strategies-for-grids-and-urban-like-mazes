@@ -1,0 +1,366 @@
+# Grid search environment + lightweight PPO training script (code only)
+# This cell defines:
+# - GridSearchEnv: a Gym-like grid environment with view distance, obstacles, belief heatmap support.
+# - SimplePPO: a compact PPO implementation (PyTorch) with advantages (GAE) and training loop utilities.
+# - A short sanity run that creates the env, takes a few random steps, and instantiates the PPO agent (no heavy training).
+#
+# Usage notes (read before running heavy training):
+# - This cell intentionally does NOT perform multi-epoch PPO training to avoid long runs here.
+# - To train on your machine or Colab: copy this entire script into a .py file or notebook cell and run the `train()` function
+#   with desired params. For Colab, enable GPU runtime (Runtime > Change runtime type > GPU).
+#
+# Dependencies: numpy, torch, matplotlib (optional). If you want gym wrappers, install gym separately.
+#
+# Author: ChatGPT (assistant) — compact, readable, and extendable Python code for immediate use.
+
+import math, random, time, os, sys
+from collections import deque, namedtuple
+from dataclasses import dataclass
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# -----------------------------
+# Environment (Gym-like)
+# -----------------------------
+class GridSearchEnv:
+    """
+    GridSearchEnv: grid-world for single-agent search.
+    - Agent and evader move synchronously (one cell per step).
+    - Detection when agent is within view (manhattan <= view_dist) AND line-of-sight (no obstacles in straight grid path).
+    - Observation: local patch (2*L+1)^2 centered on agent containing:
+        0: free cell, 1: obstacle, 2: "recently seen" timestamp (normalized), 3: agent pos, 4: belief heatmap (optional flattened)
+      plus agent global coordinates and timestep normalized.
+    - Action space: 5 discrete actions: up/down/left/right/stay.
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, rows=10, cols=30, view_dist=2, max_steps=2000, obstacles=None, seed=None,
+                 belief=False, local_size=2):
+        self.rows = rows
+        self.cols = cols
+        self.view_dist = view_dist
+        self.max_steps = max_steps
+        self.belief = belief  # whether to include belief heatmap in observation
+        self.local_size = local_size  # L: observation patch radius
+        self.rng = random.Random(seed)
+        self.np_rng = np.random.RandomState(seed if seed is not None else int(time.time()%1e6))
+        self.obstacles = set(obstacles) if obstacles else set()
+        self.step_count = 0
+        self.agent_pos = (0,0)
+        self.evader_pos = (0,0)
+        # last seen timestamps: -inf if never seen; we normalize by max_steps
+        self.last_seen = np.full((rows,cols), -1.0, dtype=float)
+        self.reset()
+
+    def reset(self, agent_start=None, evader_start=None):
+        # place agent and evader
+        free_cells = [(r,c) for r in range(self.rows) for c in range(self.cols) if (r,c) not in self.obstacles]
+        if agent_start is None:
+            self.agent_pos = (0, 0) if (0,0) not in self.obstacles else free_cells[0]
+        else:
+            self.agent_pos = agent_start
+        if evader_start is None:
+            self.evader_pos = tuple(self.np_rng.choice(len(free_cells)))  # temporary placeholder
+            # pick a uniform random free cell, ensure not equal to agent
+            self.evader_pos = self._sample_free_cell(exclude={self.agent_pos})
+        else:
+            self.evader_pos = evader_start
+        self.step_count = 0
+        self.last_seen.fill(-1.0)
+        self._update_last_seen()  # initial observation possibly sees evader
+        obs = self._make_obs()
+        return obs
+
+    def _sample_free_cell(self, exclude=None):
+        exclude = exclude or set()
+        candidates = [(r,c) for r in range(self.rows) for c in range(self.cols)
+                      if (r,c) not in self.obstacles and (r,c) not in exclude]
+        return tuple(self.np_rng.choice(len(candidates)) if False else candidates[self.np_rng.randint(len(candidates))])
+
+    def _in_bounds(self, p):
+        r,c = p
+        return 0 <= r < self.rows and 0 <= c < self.cols and (r,c) not in self.obstacles
+
+    def _manhattan(self, a,b):
+        return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+    def _line_of_sight(self, a,b):
+        # discrete approximate LOS: allow if path along grid from a to b has no obstacles (simple Bresenham-like)
+        # We'll check grid cells along Manhattan path: step in row direction then col direction and vice versa; return True if either path clear.
+        def path_clear(p,q):
+            r0,c0 = p; r1,c1 = q
+            r,c = r0,c0
+            dr = 1 if r1>r0 else -1 if r1<r0 else 0
+            dc = 1 if c1>c0 else -1 if c1<c0 else 0
+            # move rows first
+            rr,cc = r,c
+            while rr!=r1:
+                rr += dr
+                if (rr,cc) in self.obstacles: return False
+            while cc!=c1:
+                cc += dc
+                if (rr,cc) in self.obstacles: return False
+            return True
+        return path_clear(a,b) or path_clear(b,a)
+
+    def _update_last_seen(self):
+        # mark cells within view_dist and LOS as seen at current step_count
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if (r,c) in self.obstacles: continue
+                if self._manhattan((r,c), self.agent_pos) <= self.view_dist and self._line_of_sight((r,c), self.agent_pos):
+                    self.last_seen[r,c] = self.step_count
+
+    def _make_obs(self):
+        # return observation as numpy array: local patch + agent coords + normalized time + optional belief flattened
+        L = self.local_size
+        patch = np.zeros((2*L+1, 2*L+1), dtype=float)
+        ar,ac = self.agent_pos
+        for dr in range(-L, L+1):
+            for dc in range(-L, L+1):
+                rr,cc = ar+dr, ac+dc
+                if not (0 <= rr < self.rows and 0 <= cc < self.cols):
+                    patch[dr+L, dc+L] = -1.0  # out of bound marker
+                elif (rr,cc) in self.obstacles:
+                    patch[dr+L, dc+L] = -2.0  # obstacle marker
+                else:
+                    # last seen normalized in [0,1] where -1 -> 0 (never), recent -> close to 1
+                    last = self.last_seen[rr,cc]
+                    patch[dr+L, dc+L] = 0.0 if last<0 else (1.0 - (self.step_count - last)/max(1,self.max_steps))
+        # flatten patch and append agent coord and time
+        obs_vec = patch.flatten().astype(np.float32)
+        coord = np.array([self.agent_pos[0]/max(1,self.rows-1), self.agent_pos[1]/max(1,self.cols-1)], dtype=np.float32)
+        time_feat = np.array([self.step_count / max(1,self.max_steps)], dtype=np.float32)
+        obs = np.concatenate([obs_vec, coord, time_feat])
+        if self.belief:
+            # simple belief: normalized last_seen recency as heatmap flattened
+            belief_map = np.where(self.last_seen<0, 0.0, 1.0 - (self.step_count - self.last_seen)/max(1,self.max_steps))
+            obs = np.concatenate([obs, belief_map.flatten().astype(np.float32)])
+        return obs
+
+    @property
+    def observation_size(self):
+        base = (2*self.local_size+1)**2 + 3
+        if self.belief:
+            base += self.rows*self.cols
+        return base
+
+    @property
+    def action_size(self):
+        return 5  # up/down/left/right/stay
+
+    def step(self, action, evader_policy='random'):
+        """
+        action: integer 0..4
+        evader_policy: 'random' or callable(evader_pos, env)->next_pos
+        Returns: obs, reward, done, info
+        """
+        self.step_count += 1
+        # apply agent action
+        dr,dc = {0:(-1,0),1:(1,0),2:(0,-1),3:(0,1),4:(0,0)}.get(int(action), (0,0))
+        new_agent = (self.agent_pos[0]+dr, self.agent_pos[1]+dc)
+        if self._in_bounds(new_agent):
+            self.agent_pos = new_agent
+        # update last seen BEFORE evader moves (agent observes)
+        self._update_last_seen()
+        # detection check: if evader within view and LOS -> detected
+        detected = False
+        if self._manhattan(self.agent_pos, self.evader_pos) <= self.view_dist and self._line_of_sight(self.agent_pos, self.evader_pos):
+            detected = True
+
+        # move evader
+        if callable(evader_policy):
+            self.evader_pos = evader_policy(self.evader_pos, self)
+        else:
+            # random walk
+            opts = [(self.evader_pos[0]+d[0], self.evader_pos[1]+d[1]) for d in [(-1,0),(1,0),(0,-1),(0,1),(0,0)]]
+            opts = [p for p in opts if self._in_bounds(p)]
+            self.evader_pos = tuple(opts[self.np_rng.randint(len(opts))])
+
+        # after evader move, update last seen (agent may see new position)
+        self._update_last_seen()
+        if self._manhattan(self.agent_pos, self.evader_pos) <= self.view_dist and self._line_of_sight(self.agent_pos, self.evader_pos):
+            detected = True
+
+        # reward shaping: -1 per step, +large on detection, small bonus for visiting unseen cells
+        unseen_count_before = np.sum(self.last_seen >= 0)
+        reward = -1.0
+        done = False
+        info = {}
+        if detected:
+            reward += 1000.0
+            done = True
+            info['detected'] = True
+        if self.step_count >= self.max_steps:
+            done = True
+            info['timeout'] = True
+        obs = self._make_obs()
+        return obs, float(reward), done, info
+
+    def render(self):
+        # simple text render: A for agent, E for evader, # for obstacles, . for free
+        grid = [['.' for _ in range(self.cols)] for __ in range(self.rows)]
+        for (r,c) in self.obstacles:
+            grid[r][c] = '#'
+        ar,ac = self.agent_pos
+        er,ec = self.evader_pos
+        grid[ar][ac] = 'A'
+        if (er,ec) != (ar,ac):
+            grid[er][ec] = 'E'
+        s = '\n'.join(''.join(row) for row in grid)
+        print(s)
+        return s
+
+# -----------------------------
+# Compact PPO implementation (single-agent)
+# -----------------------------
+# Note: This is intentionally compact and educational; it is adequate for small environments and prototyping.
+Transition = namedtuple('Transition', ['obs','action','logp','reward','done','value'])
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_sizes=(128,128)):
+        super().__init__()
+        layers = []
+        last = obs_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(last, h))
+            layers.append(nn.ReLU())
+            last = h
+        self.policy_net = nn.Sequential(*layers)
+        self.policy_mean = nn.Linear(last, act_dim)
+        # separate critic head
+        self.value_net = nn.Sequential(nn.Linear(obs_dim, last), nn.ReLU(), nn.Linear(last,1))
+
+    def forward(self, obs):
+        # obs: [B,obs_dim]
+        pi_hidden = self.policy_net(obs)
+        logits = self.policy_mean(pi_hidden)
+        value = self.value_net(obs).squeeze(-1)
+        return logits, value
+
+def categorical_log_prob(logits, actions):
+    # logits: [B,act_dim], actions: [B]
+    logp_all = torch.log_softmax(logits, dim=-1)
+    return logp_all.gather(1, actions.unsqueeze(-1)).squeeze(-1)
+
+class SimplePPO:
+    def __init__(self, env, clip=0.2, lr=3e-4, gamma=0.99, lam=0.95, epochs=10, batch_size=64, device=None):
+        self.env = env
+        self.obs_dim = env.observation_size
+        self.act_dim = env.action_size
+        self.clip = clip; self.gamma = gamma; self.lam = lam; self.epochs = epochs; self.batch_size = batch_size
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.ac = ActorCritic(self.obs_dim, self.act_dim).to(self.device)
+        self.optimizer = optim.Adam(self.ac.parameters(), lr=lr)
+        # storage for rollout
+        self.buffer = []
+
+    def select_action(self, obs):
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        logits, value = self.ac(obs_t)
+        probs = torch.softmax(logits, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample().item()
+        logp = dist.log_prob(torch.tensor(action, device=self.device))
+        return action, logp.item(), value.item()
+
+    def store(self, *args):
+        self.buffer.append(Transition(*args))
+
+    def compute_gae(self, last_value=0.0):
+        rewards = [t.reward for t in self.buffer]
+        values = [t.value for t in self.buffer] + [last_value]
+        dones = [t.done for t in self.buffer]
+        gae = 0.0
+        returns = []
+        advs = []
+        for step in reversed(range(len(rewards))):
+            delta = rewards[step] + self.gamma * values[step+1] * (0 if dones[step] else 1) - values[step]
+            gae = delta + self.gamma * self.lam * (0 if dones[step] else 1) * gae
+            advs.insert(0, gae)
+            returns.insert(0, gae + values[step])
+        advs = np.array(advs, dtype=np.float32)
+        returns = np.array(returns, dtype=np.float32)
+        # normalize advantages
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+        return advs, returns
+
+    def update(self, last_value=0.0):
+        if len(self.buffer) == 0:
+            return
+        advs, returns = self.compute_gae(last_value=last_value)
+        obs = torch.as_tensor(np.vstack([t.obs for t in self.buffer]), dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(np.array([t.action for t in self.buffer]), dtype=torch.long, device=self.device)
+        old_logp = torch.as_tensor(np.array([t.logp for t in self.buffer]), dtype=torch.float32, device=self.device)
+        returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        advs_t = torch.as_tensor(advs, dtype=torch.float32, device=self.device)
+
+        dataset = torch.utils.data.TensorDataset(obs, actions, old_logp, returns_t, advs_t)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        for _ in range(self.epochs):
+            for batch in loader:
+                b_obs, b_act, b_oldlogp, b_ret, b_adv = [x.to(self.device) for x in batch]
+                logits, value = self.ac(b_obs)
+                logp = categorical_log_prob(logits, b_act)
+                ratio = torch.exp(logp - b_oldlogp)
+                surr1 = ratio * b_adv
+                surr2 = torch.clamp(ratio, 1.0-self.clip, 1.0+self.clip) * b_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = ((value - b_ret)**2).mean()
+                loss = policy_loss + 0.5 * value_loss
+                self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+        # clear buffer
+        self.buffer = []
+
+    def train_epoch(self, steps_per_epoch=2048, evader_policy='random'):
+        obs = self.env.reset()
+        ep_ret = 0.0; ep_len = 0
+        for t in range(steps_per_epoch):
+            action, logp, value = self.select_action(obs)
+            new_obs, reward, done, info = self.env.step(action, evader_policy=evader_policy)
+            self.store(obs, action, logp, reward, done, value)
+            obs = new_obs
+            ep_ret += reward; ep_len += 1
+            if done:
+                obs = self.env.reset()
+                ep_ret = 0.0; ep_len = 0
+        # when epoch ends, compute last_value bootstrap (value of current obs)
+        with torch.no_grad():
+            _, last_value = self.ac(torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0))
+            last_value = last_value.item()
+        self.update(last_value=last_value)
+
+    def save(self, path):
+        torch.save(self.ac.state_dict(), path)
+
+    def load(self, path):
+        self.ac.load_state_dict(torch.load(path, map_location=self.device))
+
+# -----------------------------
+# Small sanity demo (no heavy training)
+# -----------------------------
+def _sanity_run():
+    print("Sanity run: instantiate env and PPO agent (no training).")
+    env = GridSearchEnv(rows=10, cols=30, view_dist=2, max_steps=500, belief=False, local_size=2, seed=1)
+    obs = env.reset()
+    print("Observation size:", env.observation_size, "Action size:", env.action_size)
+    # take a few random steps
+    for i in range(5):
+        a = random.randrange(env.action_size)
+        obs, r, done, info = env.step(a)
+    # instantiate PPO
+    ppo = SimplePPO(env, clip=0.2, lr=3e-4, gamma=0.99, lam=0.95, epochs=4, batch_size=64)
+    print("PPO agent created. Device:", ppo.device)
+    # print model parameter count
+    param_count = sum(p.numel() for p in ppo.ac.parameters())
+    print("ActorCritic parameter count:", param_count)
+    return env, ppo
+
+if __name__ == "__main__":
+    # run small check when executed as script
+    env, ppo = _sanity_run()
+    # NOTE: to run training, call ppo.train_epoch() in a loop and save models periodically.
+    print("To train: call ppo.train_epoch(steps_per_epoch=2048) repeatedly (do not run heavy training inside this demo).")
+
